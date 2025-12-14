@@ -1,6 +1,6 @@
 """
-Pipeline ETL simplificado - Historias Clínicas SPACCC
-Modelo: PlanTL-GOB-ES/roberta-base-biomedical-clinical-es
+Pipeline ETL - Historias Clínicas SPACCC
+Modelo: Zero-shot classification con batching para GPU
 """
 
 import os
@@ -9,92 +9,81 @@ import csv
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
-import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import pipeline
+from datasets import Dataset
 
 # ==============================================================================
 # CONFIGURACIÓN
 # ==============================================================================
 
 INPUT_DIR = "./SPACCC/corpus"
-OUTPUT_CSV = "./staging_historias.csv"
-MODELO = "PlanTL-GOB-ES/roberta-base-biomedical-clinical-es"
-MAX_ARCHIVOS = 20  # None para procesar todos (total 1000)
+OUTPUT_CSV = "./data/staging_historias.csv"
+MAX_ARCHIVOS = None  # None para procesar todos
+BATCH_SIZE = 16  # Ajustar según memoria GPU (8, 16, 32)
 
 ESPECIALIDADES = [
-    "Oncología", "Urología", "Cardiología", "Neurología", 
-    "Neumología", "Digestivo", "Nefrología", "Traumatología",
-    "Endocrinología", "Dermatología", "Ginecología", "Hematología"
+    "Urología",           # Muy frecuente en SPACCC
+    "Cirugía General",    # Casos quirúrgicos
+    "Medicina Interna",   # Casos médicos generales
+    "Traumatología",      # Fracturas, lesiones
+    "Oncología",          # Tumores
+    "Digestivo",          # Aparato digestivo
+    "Cardiología",        # Casos cardíacos
+    "Neurología",         # Sistema nervioso
+    "Nefrología",         # Riñón
+    "Neumología"          # Pulmón
 ]
 
 DIAGNOSTICOS = [
-    "Neoplasia maligna", "Neoplasia benigna", "Infección",
-    "Inflamatorio", "Degenerativo", "Traumático", "Vascular"
+    "Neoplasia maligna",          # Carcinomas, adenocarcinomas, cáncer
+    "Neoplasia benigna",          # Tumores benignos, pólipos, adenomas
+    "Quiste",                     # Quistes de cualquier tipo
+    "Infección",                  # Bacteriana, viral, parasitaria
+    "Traumatismo",                # Fracturas, heridas, lesiones
+    "Enfermedad cardiovascular",  # Infarto, arritmias, insuficiencia cardíaca
+    "Enfermedad neurológica",     # Parálisis, neuropatías, epilepsia
+    "Patología inflamatoria",     # Inflamaciones, artritis
+    "Enfermedad metabólica",      # Diabetes, tiroides, insuficiencia renal
+    "Obstrucción",                # Litiasis, estenosis, hernias
+    "Malformación congénita",     # Anomalías del desarrollo
+    "Enfermedad autoinmune",      # Lupus, esclerosis, etc.
+    "Patología vascular",         # Trombosis, aneurismas, varices
+    "Lesión cutánea"              # Úlceras, dermatitis, linfedema
 ]
 
 TRATAMIENTOS = [
-    "Quirúrgico", "Farmacológico", "Quimioterapia", 
-    "Radioterapia", "Conservador", "Observación"
+    "Cirugía abierta",        # Intervención quirúrgica tradicional
+    "Cirugía laparoscópica",  # Mínimamente invasiva
+    "Tratamiento médico",     # Fármacos, antibióticos
+    "Quimioterapia",          # Tratamiento oncológico
+    "Radioterapia",           # Tratamiento oncológico
+    "Endoscopia",             # Procedimientos endoscópicos
+    "Observación",            # Seguimiento sin intervención
+    "Combinado"               # Varios tratamientos
 ]
 
 # ==============================================================================
 # CARGAR MODELO
 # ==============================================================================
 
-print(f"Cargando modelo {MODELO}...")
-tokenizer = AutoTokenizer.from_pretrained(MODELO)
-model = AutoModel.from_pretrained(MODELO)
-model.eval()
-print("Modelo cargado correctamente")
+print("Cargando modelo zero-shot classification en GPU...")
+clasificador = pipeline(
+    "zero-shot-classification",
+    model="joeddav/xlm-roberta-large-xnli",
+    device=0,  # GPU
+    batch_size=BATCH_SIZE
+)
+print("Modelo cargado en GPU")
 
 # ==============================================================================
-# FUNCIONES AUXILIARES
+# FUNCIONES REGEX
 # ==============================================================================
-
-def obtener_embedding(texto, max_length=512):
-    """Obtiene el embedding de un texto usando RoBERTa"""
-    inputs = tokenizer(
-        texto, 
-        return_tensors="pt", 
-        truncation=True, 
-        max_length=max_length,
-        padding=True
-    )
-    
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    # Usar el embedding del token [CLS] (posición 0)
-    embedding = outputs.last_hidden_state[:, 0, :].squeeze()
-    return embedding
-
-
-def similitud_coseno(emb1, emb2):
-    """Calcula similitud de coseno entre dos embeddings"""
-    return torch.nn.functional.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
-
-
-def clasificar_texto(texto, categorias, embeddings_categorias):
-    """Clasifica un texto en la categoría más similar"""
-    emb_texto = obtener_embedding(texto)
-    
-    mejor_categoria = None
-    mejor_score = -1
-    
-    for cat, emb_cat in zip(categorias, embeddings_categorias):
-        score = similitud_coseno(emb_texto, emb_cat)
-        if score > mejor_score:
-            mejor_score = score
-            mejor_categoria = cat
-    
-    return mejor_categoria, mejor_score
-
 
 def extraer_edad(texto):
-    """Extrae la edad del paciente"""
     patrones = [
-        r'(?:paciente|varón|mujer)\s+de\s+(\d{1,3})\s*(?:años|a\.)',
+        r'(?:paciente|varón|mujer|niño|niña|hombre)\s+de\s+(\d{1,3})\s*(?:años|a\.)',
         r'(\d{1,3})\s*(?:años|a\.)\s+de\s+edad',
+        r'(\d{1,3})\s*años,?\s+(?:varón|mujer)',
     ]
     texto_lower = texto.lower()
     for patron in patrones:
@@ -107,100 +96,30 @@ def extraer_edad(texto):
 
 
 def extraer_sexo(texto):
-    """Extrae el sexo del paciente"""
     texto_lower = texto.lower()
-    if re.search(r'\b(varón|hombre|masculino)\b', texto_lower):
+    if re.search(r'\b(varón|hombre|masculino|niño)\b', texto_lower):
         return "Masculino"
-    if re.search(r'\b(mujer|femenino|femenina)\b', texto_lower):
+    if re.search(r'\b(mujer|femenino|femenina|niña)\b', texto_lower):
         return "Femenino"
     return None
 
 
-def extraer_datos_oncologicos(texto):
-    """Extrae biomarcadores oncológicos"""
-    datos = {}
-    
-    # Estadio TNM
-    match = re.search(r'(T[0-4][a-c]?\s*N[0-3][a-c]?\s*M[0-1])', texto, re.IGNORECASE)
-    if match:
-        datos['estadio_tnm'] = match.group(1)
-    
-    # Ki67
-    match = re.search(r'ki[\-\s]?67[:\s]*(\d{1,3})\s*%', texto, re.IGNORECASE)
-    if match:
-        datos['ki67_porcentaje'] = float(match.group(1))
-    
-    # HER2
-    match = re.search(r'HER[\-\s]?2[:\s]*(positivo|negativo|\+{1,3})', texto, re.IGNORECASE)
-    if match:
-        datos['her2_status'] = match.group(1)
-    
-    # Gleason (próstata)
-    match = re.search(r'Gleason\s+(\d{1,2})', texto, re.IGNORECASE)
-    if match:
-        datos['grado_histologico'] = f"Gleason {match.group(1)}"
-    
-    return datos
-
-
 # ==============================================================================
-# PRE-CALCULAR EMBEDDINGS DE CATEGORÍAS
+# CLASIFICACIÓN EN BATCH
 # ==============================================================================
 
-print("Calculando embeddings de categorías...")
-emb_especialidades = [obtener_embedding(f"Especialidad médica: {cat}") for cat in ESPECIALIDADES]
-emb_diagnosticos = [obtener_embedding(f"Diagnóstico: {cat}") for cat in DIAGNOSTICOS]
-emb_tratamientos = [obtener_embedding(f"Tratamiento: {cat}") for cat in TRATAMIENTOS]
-print("Embeddings calculados")
-
-# ==============================================================================
-# PROCESAR DOCUMENTOS
-# ==============================================================================
-
-def procesar_documento(nombre_archivo, texto):
-    """Procesa un documento y retorna un diccionario con los datos extraídos"""
+def clasificar_batch(textos, etiquetas, hypothesis):
+    """Clasifica una lista de textos en batch"""
+    textos_truncados = [t for t in textos]
     
-    # Clasificar
-    especialidad, conf_esp = clasificar_texto(texto, ESPECIALIDADES, emb_especialidades)
-    diagnostico, conf_dx = clasificar_texto(texto, DIAGNOSTICOS, emb_diagnosticos)
-    tratamiento, conf_tx = clasificar_texto(texto, TRATAMIENTOS, emb_tratamientos)
+    resultados = clasificador(
+        textos_truncados,
+        candidate_labels=etiquetas,
+        hypothesis_template=hypothesis
+    )
     
-    # Extraer datos básicos
-    edad = extraer_edad(texto)
-    sexo = extraer_sexo(texto)
-    
-    # Confidence promedio
-    confidence = round((conf_esp + conf_dx + conf_tx) / 3, 4)
-    
-    # Datos base
-    resultado = {
-        'nombre_archivo': nombre_archivo,
-        'texto_original': texto.replace('\n', ' ').replace('\r', ' '),
-        'especialidad': especialidad,
-        'diagnostico': diagnostico,
-        'tratamiento': tratamiento,
-        'edad_paciente': edad,
-        'sexo_paciente': sexo,
-        'confidence_score': confidence,
-        'tipo_tumor': None,
-        'localizacion': None,
-        'estadio_tnm': None,
-        'grado_histologico': None,
-        'ki67_porcentaje': None,
-        'her2_status': None,
-        'receptor_estrogeno': None,
-        'receptor_progesterona': None,
-        'metastasis': None,
-        'tratamiento_onco': None,
-        'fecha_procesamiento': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    
-    # Si es oncología, extraer datos adicionales
-    if especialidad == "Oncología":
-        datos_onco = extraer_datos_oncologicos(texto)
-        resultado.update(datos_onco)
-    
-    return resultado
+    # Extraer mejor etiqueta y score de cada resultado
+    return [(r['labels'][0], r['scores'][0]) for r in resultados]
 
 
 # ==============================================================================
@@ -209,41 +128,75 @@ def procesar_documento(nombre_archivo, texto):
 
 def main():
     print("\n" + "="*60)
-    print("PIPELINE ETL - HISTORIAS CLÍNICAS SPACCC")
+    print("PIPELINE ETL - HISTORIAS CLÍNICAS SPACCC ")
     print("="*60)
     
-    # Verificar directorio
+    # Cargar archivos
     input_path = Path(INPUT_DIR)
     if not input_path.exists():
         print(f"ERROR: Directorio no encontrado: {INPUT_DIR}")
-        print("Crea el directorio y coloca los archivos .txt del corpus")
         return
     
-    # Cargar archivos
     archivos = list(input_path.glob("*.txt"))
     if MAX_ARCHIVOS:
         archivos = archivos[:MAX_ARCHIVOS]
-    print(f"\nEncontrados {len(archivos)} archivos .txt")
+    print(f"\nCargando {len(archivos)} archivos...")
     
-    # Procesar
-    resultados = []
-    for archivo in tqdm(archivos, desc="Procesando"):
+    # Leer todos los textos
+    nombres = []
+    textos = []
+    for archivo in tqdm(archivos, desc="Leyendo"):
         try:
             with open(archivo, 'r', encoding='utf-8') as f:
-                texto = f.read()
-            resultado = procesar_documento(archivo.name, texto)
-            resultados.append(resultado)
+                textos.append(f.read())
+                nombres.append(archivo.name)
         except Exception as e:
-            print(f"Error en {archivo.name}: {e}")
+            print(f"Error leyendo {archivo.name}: {e}")
+    
+    print(f"\n Clasificando {len(textos)} documentos en batches de {BATCH_SIZE}...")
+    
+    # Clasificar en batches con progreso
+    print("\n[1/3] Clasificando especialidades...")
+    esp_results = []
+    for i in tqdm(range(0, len(textos), BATCH_SIZE), desc="Especialidades"):
+        batch = textos[i:i+BATCH_SIZE]
+        esp_results.extend(clasificar_batch(batch, ESPECIALIDADES, "Este caso clínico es de {}."))
+    
+    print("\n[2/3] Clasificando diagnósticos...")
+    dx_results = []
+    for i in tqdm(range(0, len(textos), BATCH_SIZE), desc="Diagnósticos"):
+        batch = textos[i:i+BATCH_SIZE]
+        dx_results.extend(clasificar_batch(batch, DIAGNOSTICOS, "El diagnóstico principal es {}."))
+    
+    print("\n[3/3] Clasificando tratamientos...")
+    tx_results = []
+    for i in tqdm(range(0, len(textos), BATCH_SIZE), desc="Tratamientos"):
+        batch = textos[i:i+BATCH_SIZE]
+        tx_results.extend(clasificar_batch(batch, TRATAMIENTOS, "El tratamiento aplicado fue {}."))
+    
+    # Construir resultados
+    print("\n Extrayendo datos demográficos...")
+    resultados = []
+    for i, (nombre, texto) in enumerate(zip(nombres, textos)):
+        esp, conf_esp = esp_results[i]
+        dx, conf_dx = dx_results[i]
+        tx, conf_tx = tx_results[i]
+        
+        resultados.append({
+            'nombre_archivo': nombre,
+            'especialidad': esp,
+            'diagnostico': dx,
+            'tratamiento': tx,
+            'edad_paciente': extraer_edad(texto) or '',
+            'sexo_paciente': extraer_sexo(texto) or '',
+            'confidence_score': round((conf_esp + conf_dx + conf_tx) / 3, 4),
+            'fecha_procesamiento': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
     
     # Exportar CSV
     columnas = [
-        'nombre_archivo', 'texto_original', 'especialidad', 'diagnostico',
-        'tratamiento', 'edad_paciente', 'sexo_paciente', 'confidence_score',
-        'tipo_tumor', 'localizacion', 'estadio_tnm', 'grado_histologico',
-        'ki67_porcentaje', 'her2_status', 'receptor_estrogeno',
-        'receptor_progesterona', 'metastasis', 'tratamiento_onco',
-        'fecha_procesamiento'
+        'nombre_archivo', 'especialidad', 'diagnostico', 'tratamiento',
+        'edad_paciente', 'sexo_paciente', 'confidence_score', 'fecha_procesamiento'
     ]
     
     with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8-sig') as f:
@@ -251,7 +204,7 @@ def main():
         writer.writeheader()
         writer.writerows(resultados)
     
-    print(f"\n✅ CSV exportado: {OUTPUT_CSV}")
+    print(f"\n CSV exportado: {OUTPUT_CSV}")
     
     # Estadísticas
     print("\n" + "="*60)
@@ -259,19 +212,14 @@ def main():
     print("="*60)
     print(f"Total procesados: {len(resultados)}")
     
-    # Contar por especialidad
-    conteo_esp = {}
-    for r in resultados:
-        esp = r['especialidad']
-        conteo_esp[esp] = conteo_esp.get(esp, 0) + 1
-    
-    print("\nPor especialidad:")
-    for esp, count in sorted(conteo_esp.items(), key=lambda x: -x[1]):
-        print(f"  {esp}: {count}")
-    
-    # Contar oncología
-    onco = sum(1 for r in resultados if r['especialidad'] == 'Oncología')
-    print(f"\nCasos oncológicos: {onco}")
+    for campo, nombre in [('especialidad', 'Especialidad'), ('diagnostico', 'Diagnóstico'), ('tratamiento', 'Tratamiento')]:
+        conteo = {}
+        for r in resultados:
+            val = r[campo]
+            conteo[val] = conteo.get(val, 0) + 1
+        print(f"\nPor {nombre}:")
+        for val, count in sorted(conteo.items(), key=lambda x: -x[1]):
+            print(f"  {val}: {count}")
 
 
 if __name__ == "__main__":
